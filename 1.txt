@@ -1,0 +1,8 @@
+powershell -ExecutionPolicy Bypass -File .\run.ps1I found system gi at C:\Program Files\gstreamer\1.0\msvc_x86_64\lib\site-packages, so I’m patching startup to auto-wire that path and adjusting dependencies to avoid Windows PyGObject build failures.
+
+conda --version
+conda env list | Out-String
+conda create -y -n rtsp39 python=3.9 pip
+
+$gstRoot='C:\Program Files\gstreamer\1.0\msvc_x86_64'; $env:PYTHONPATH="$gstRoot\lib\site-packages"; $env:PATH="$gstRoot\bin;$env:PATH"; conda run -n rtsp39 python app.py
+$gstRoot='C:\Program Files\gstreamer\1.0\msvc_x86_64'; $env:PYTHONPATH="$gstRoot\lib\site-packages"; $env:PATH="$gstRoot\bin;$env:PATH"; conda run -n rtsp39 python app.py

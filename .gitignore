@@ -1,0 +1,28 @@
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+rtsp_env/
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+
+# Project-generated portable artifacts
+_portable_build/
+_portable_smoketest/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log

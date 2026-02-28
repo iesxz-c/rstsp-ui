@@ -1,0 +1,2 @@
+PyQt5>=5.15
+PyGObject>=3.46; platform_system != "Windows"
