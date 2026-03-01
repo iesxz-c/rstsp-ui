@@ -72,11 +72,25 @@ class StreamConfig:
 
 
 class VideoWidget(QWidget):
+    zoom_requested = pyqtSignal(int)
+
     def __init__(self) -> None:
         super().__init__()
         self.setAttribute(Qt.WA_NativeWindow)
         self.setMinimumSize(640, 360)
         self.setStyleSheet("background-color: black;")
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.zoom_requested.emit(1)
+            event.accept()
+            return
+        if delta < 0:
+            self.zoom_requested.emit(-1)
+            event.accept()
+            return
+        event.ignore()
 
 
 class GstWorker(QObject):
@@ -94,6 +108,7 @@ class GstWorker(QObject):
         self._pipeline: Gst.Pipeline | None = None
         self._source: Gst.Element | None = None
         self._decodebin: Gst.Element | None = None
+        self._crop: Gst.Element | None = None
         self._convert: Gst.Element | None = None
         self._queue_el: Gst.Element | None = None
         self._sink: Gst.Element | None = None
@@ -101,6 +116,11 @@ class GstWorker(QObject):
         self._video_window_id: int | None = None
         self._is_connected = False
         self._command_source: GLib.Source | None = None
+        self._zoom_factor = 1.0
+        self._zoom_step = 0.25
+        self._max_zoom = 4.0
+        self._video_width = 0
+        self._video_height = 0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -119,6 +139,15 @@ class GstWorker(QObject):
 
     def disconnect_stream(self) -> None:
         self._cmd_queue.put(("disconnect", None))
+
+    def zoom_in(self) -> None:
+        self._cmd_queue.put(("zoom_in", None))
+
+    def zoom_out(self) -> None:
+        self._cmd_queue.put(("zoom_out", None))
+
+    def reset_zoom(self) -> None:
+        self._cmd_queue.put(("reset_zoom", None))
 
     def _thread_main(self) -> None:
         self._context = GLib.MainContext.new()
@@ -157,6 +186,12 @@ class GstWorker(QObject):
                 if self._loop and self._loop.is_running():
                     self._loop.quit()
                 return False
+            elif cmd == "zoom_in":
+                self._change_zoom(self._zoom_step)
+            elif cmd == "zoom_out":
+                self._change_zoom(-self._zoom_step)
+            elif cmd == "reset_zoom":
+                self._reset_zoom()
             else:
                 self.log.emit(f"WARN: Unknown command received: {cmd}")
 
@@ -174,6 +209,7 @@ class GstWorker(QObject):
 
         source = Gst.ElementFactory.make("rtspsrc", "source")
         decodebin = Gst.ElementFactory.make("decodebin", "decodebin")
+        crop = Gst.ElementFactory.make("videocrop", "crop")
         convert = Gst.ElementFactory.make("videoconvert", "convert")
         queue_el = Gst.ElementFactory.make("queue", "queue")
 
@@ -188,6 +224,9 @@ class GstWorker(QObject):
             self.log.emit("ERROR: Missing required GStreamer plugin(s)")
             self.stream_disconnected.emit("missing_plugins")
             return
+
+        if crop is None:
+            self.log.emit("WARN: videocrop plugin missing. Zoom controls disabled.")
 
         source.set_property("location", config.url)
         source.set_property("latency", config.latency_ms)
@@ -209,9 +248,17 @@ class GstWorker(QObject):
 
         pipeline.add(source)
         pipeline.add(decodebin)
+        if crop is not None:
+            pipeline.add(crop)
         pipeline.add(convert)
         pipeline.add(queue_el)
         pipeline.add(sink)
+
+        if crop is not None:
+            if not crop.link(convert):
+                self.log.emit("ERROR: Failed to link videocrop -> videoconvert")
+                self.stream_disconnected.emit("link_failed")
+                return
 
         if not convert.link(queue_el):
             self.log.emit("ERROR: Failed to link videoconvert -> queue")
@@ -236,9 +283,13 @@ class GstWorker(QObject):
         self._pipeline = pipeline
         self._source = source
         self._decodebin = decodebin
+        self._crop = crop
         self._convert = convert
         self._queue_el = queue_el
         self._sink = sink
+        self._zoom_factor = 1.0
+        self._video_width = 0
+        self._video_height = 0
 
         ret = pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
@@ -294,7 +345,8 @@ class GstWorker(QObject):
             self.log.emit(f"ERROR: Failed linking RTSP pad: {result}")
 
     def _on_decodebin_pad_added(self, decodebin: Gst.Element, pad: Gst.Pad) -> None:
-        if self._convert is None:
+        target = self._crop or self._convert
+        if target is None:
             return
 
         pad_caps = pad.get_current_caps() or pad.query_caps()
@@ -306,9 +358,12 @@ class GstWorker(QObject):
         if not caps_name.startswith("video/"):
             return
 
-        sink_pad = self._convert.get_static_pad("sink")
+        self._video_width = structure.get_value("width") if structure.has_field("width") else 0
+        self._video_height = structure.get_value("height") if structure.has_field("height") else 0
+
+        sink_pad = target.get_static_pad("sink")
         if sink_pad is None:
-            self.log.emit("ERROR: videoconvert sink pad unavailable")
+            self.log.emit("ERROR: decoder target sink pad unavailable")
             return
         if sink_pad.is_linked():
             return
@@ -316,8 +371,61 @@ class GstWorker(QObject):
         result = pad.link(sink_pad)
         if result == Gst.PadLinkReturn.OK:
             self.log.emit(f"Decode pad linked: {caps_name}")
+            self._apply_zoom_crop()
         else:
             self.log.emit(f"ERROR: Failed linking decodebin pad: {result}")
+
+    def _change_zoom(self, delta: float) -> None:
+        if self._crop is None:
+            self.log.emit("WARN: Zoom unavailable (videocrop plugin missing)")
+            return
+
+        new_zoom = max(1.0, min(self._max_zoom, self._zoom_factor + delta))
+        if abs(new_zoom - self._zoom_factor) < 1e-6:
+            return
+
+        self._zoom_factor = new_zoom
+        self._apply_zoom_crop()
+        self.log.emit(f"Zoom: {self._zoom_factor:.2f}x")
+
+    def _reset_zoom(self) -> None:
+        if self._crop is None:
+            self.log.emit("WARN: Zoom unavailable (videocrop plugin missing)")
+            return
+        if self._zoom_factor == 1.0:
+            return
+        self._zoom_factor = 1.0
+        self._apply_zoom_crop()
+        self.log.emit("Zoom reset: 1.00x")
+
+    def _apply_zoom_crop(self) -> None:
+        if self._crop is None:
+            return
+
+        if self._zoom_factor <= 1.0:
+            self._crop.set_property("left", 0)
+            self._crop.set_property("right", 0)
+            self._crop.set_property("top", 0)
+            self._crop.set_property("bottom", 0)
+            return
+
+        width = int(self._video_width or 0)
+        height = int(self._video_height or 0)
+        if width <= 0 or height <= 0:
+            return
+
+        visible_width = max(2, int(width / self._zoom_factor))
+        visible_height = max(2, int(height / self._zoom_factor))
+
+        left = max(0, (width - visible_width) // 2)
+        right = max(0, width - visible_width - left)
+        top = max(0, (height - visible_height) // 2)
+        bottom = max(0, height - visible_height - top)
+
+        self._crop.set_property("left", left)
+        self._crop.set_property("right", right)
+        self._crop.set_property("top", top)
+        self._crop.set_property("bottom", bottom)
 
     def _on_sync_message(self, bus: Gst.Bus, message: Gst.Message) -> None:
         if self._video_window_id is None:
@@ -378,10 +486,14 @@ class GstWorker(QObject):
         self._pipeline = None
         self._source = None
         self._decodebin = None
+        self._crop = None
         self._convert = None
         self._queue_el = None
         self._sink = None
         self._is_connected = False
+        self._zoom_factor = 1.0
+        self._video_width = 0
+        self._video_height = 0
 
 
 class MainWindow(QMainWindow):
@@ -411,8 +523,12 @@ class MainWindow(QMainWindow):
 
         main_layout = QVBoxLayout(root)
 
-        controls = QWidget()
-        grid = QGridLayout(controls)
+        content_layout = QHBoxLayout()
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
 
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("rtsp://user:password@camera-ip:554/stream")
@@ -436,39 +552,65 @@ class MainWindow(QMainWindow):
 
         self.connect_btn = QPushButton("Connect")
         self.disconnect_btn = QPushButton("Disconnect")
+        self.zoom_in_btn = QPushButton("Zoom In")
+        self.zoom_out_btn = QPushButton("Zoom Out")
+        self.reset_zoom_btn = QPushButton("Reset Zoom")
         self.disconnect_btn.setEnabled(False)
+        self.zoom_in_btn.setEnabled(False)
+        self.zoom_out_btn.setEnabled(False)
+        self.reset_zoom_btn.setEnabled(False)
 
         self.connect_btn.clicked.connect(self._connect_clicked)
         self.disconnect_btn.clicked.connect(self._disconnect_clicked)
+        self.zoom_in_btn.clicked.connect(self._zoom_in_clicked)
+        self.zoom_out_btn.clicked.connect(self._zoom_out_clicked)
+        self.reset_zoom_btn.clicked.connect(self._reset_zoom_clicked)
+
+        self.video_widget = VideoWidget()
+        self.video_widget.zoom_requested.connect(self._on_video_zoom_requested)
+        left_layout.addWidget(self.video_widget)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+
+        controls = QWidget()
+        grid = QGridLayout(controls)
 
         grid.addWidget(QLabel("RTSP URL"), 0, 0)
-        grid.addWidget(self.url_input, 0, 1, 1, 5)
+        grid.addWidget(self.url_input, 1, 0, 1, 2)
 
-        grid.addWidget(QLabel("Latency"), 1, 0)
-        grid.addWidget(self.latency_input, 1, 1)
+        grid.addWidget(QLabel("Latency"), 2, 0)
+        grid.addWidget(self.latency_input, 3, 0)
 
-        grid.addWidget(QLabel("Protocol"), 1, 2)
-        grid.addWidget(self.protocol_box, 1, 3)
+        grid.addWidget(QLabel("Protocol"), 2, 1)
+        grid.addWidget(self.protocol_box, 3, 1)
 
-        grid.addWidget(self.auto_reconnect_box, 1, 4)
-        grid.addWidget(self.retry_interval_input, 1, 5)
+        grid.addWidget(self.auto_reconnect_box, 4, 0)
+        grid.addWidget(self.retry_interval_input, 4, 1)
 
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.connect_btn)
         btn_row.addWidget(self.disconnect_btn)
-        btn_row.addStretch(1)
+        grid.addLayout(btn_row, 5, 0, 1, 2)
 
-        self.video_widget = VideoWidget()
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(self.zoom_in_btn)
+        zoom_row.addWidget(self.zoom_out_btn)
+        zoom_row.addWidget(self.reset_zoom_btn)
+        grid.addLayout(zoom_row, 6, 0, 1, 2)
 
         self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
         self.logs.setMaximumBlockCount(1500)
 
-        main_layout.addWidget(controls)
-        main_layout.addLayout(btn_row)
-        main_layout.addWidget(self.video_widget, stretch=3)
-        main_layout.addWidget(QLabel("Monitoring Logs"))
-        main_layout.addWidget(self.logs, stretch=2)
+        right_layout.addWidget(controls)
+        right_layout.addWidget(QLabel("Monitoring Logs"))
+        right_layout.addWidget(self.logs, stretch=1)
+
+        content_layout.addWidget(left_panel, stretch=3)
+        content_layout.addWidget(right_panel, stretch=1)
+
+        main_layout.addLayout(content_layout)
 
     def _connect_clicked(self) -> None:
         url = self.url_input.text().strip()
@@ -489,6 +631,9 @@ class MainWindow(QMainWindow):
         self.connected = True
         self.connect_btn.setEnabled(False)
         self.disconnect_btn.setEnabled(True)
+        self.zoom_in_btn.setEnabled(True)
+        self.zoom_out_btn.setEnabled(True)
+        self.reset_zoom_btn.setEnabled(True)
 
     def _disconnect_clicked(self) -> None:
         self.reconnect_timer.stop()
@@ -496,6 +641,26 @@ class MainWindow(QMainWindow):
         self.connected = False
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
+        self.zoom_in_btn.setEnabled(False)
+        self.zoom_out_btn.setEnabled(False)
+        self.reset_zoom_btn.setEnabled(False)
+
+    def _zoom_in_clicked(self) -> None:
+        self.worker.zoom_in()
+
+    def _zoom_out_clicked(self) -> None:
+        self.worker.zoom_out()
+
+    def _reset_zoom_clicked(self) -> None:
+        self.worker.reset_zoom()
+
+    def _on_video_zoom_requested(self, direction: int) -> None:
+        if not self.connected:
+            return
+        if direction > 0:
+            self.worker.zoom_in()
+        elif direction < 0:
+            self.worker.zoom_out()
 
     def _on_state_changed(self, old_state: str, new_state: str) -> None:
         self._append_log(f"State transition: {old_state} → {new_state}")
